@@ -1,0 +1,1620 @@
+import { PassThrough } from "stream";
+import path from "path";
+import _ from "lodash";
+import mime from "mime";
+import sharp from "sharp";
+import FormData from "form-data";
+import axios, { AxiosResponse } from "axios";
+
+import APIException from "@/lib/exceptions/APIException.ts";
+import EX from "@/api/consts/exceptions.ts";
+import { createParser } from "eventsource-parser";
+import logger from "@/lib/logger.ts";
+import util from "@/lib/util.ts";
+import environment from "@/lib/environment.ts";
+
+// 模型名称
+const MODEL_NAME = "glm-5.3";
+// ChatGLM 网页端默认助手 ID；GLM-5.3 通过 meta_data.selected_model 选择
+// 该 ID 是当前网页版请求中实际使用的 assistant_id。
+const DEFAULT_ASSISTANT_ID = "65940acff94777010aa6b796";
+// 签名密钥（官网变化记得更新）
+const SIGN_SECRET = environment.signSecret || "8a1317a7468aa3ad86e997d08f3f31cb";
+// access_token有效期
+const ACCESS_TOKEN_EXPIRES = 3600;
+// 最大重试次数
+const MAX_RETRY_COUNT = 3;
+// 重试延迟
+const RETRY_DELAY = 5000;
+
+// User-Agent列表
+const USER_AGENTS = [
+  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+  "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:124.0) Gecko/20100101 Firefox/124.0",
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0"
+];
+
+// 伪装headers
+const FAKE_HEADERS = {
+  "Accept": "text/event-stream",
+  "Accept-Encoding": "gzip, deflate, br, zstd",
+  "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6",
+  "App-Name": "chatglm",
+  "Cache-Control": "no-cache",
+  "Content-Type": "application/json",
+  "Origin": "https://chatglm.cn",
+  "Pragma": "no-cache",
+  "Priority": "u=1, i",
+  "Sec-Ch-Ua": '"Microsoft Edge";v="143", "Chromium";v="143", "Not A(Brand";v="24"',
+  "Sec-Ch-Ua-Mobile": "?0",
+  "Sec-Ch-Ua-Platform": '"Windows"',
+  "Sec-Fetch-Dest": "empty",
+  "Sec-Fetch-Mode": "cors",
+  "Sec-Fetch-Site": "same-origin",
+  "X-App-Fr": "browser_extension",
+  "X-App-Platform": "pc",
+  "X-App-Version": "0.0.1",
+  "X-Device-Brand": "",
+  "X-Device-Model": "",
+  "X-Exp-Groups": "na_android_config:exp:NA,na_4o_config:exp:4o_A,tts_config:exp:tts_config_a,na_glm4plus_config:exp:open,mainchat_server_app:exp:A,mobile_history_daycheck:exp:a,desktop_toolbar:exp:A,chat_drawing_server:exp:A,drawing_server_cogview:exp:cogview4,app_welcome_v2:exp:A,chat_drawing_streamv2:exp:A,mainchat_rm_fc:exp:add,mainchat_dr:exp:open,chat_auto_entrance:exp:A,drawing_server_hi_dream:control:A,homepage_square:exp:close,assistant_recommend_prompt:exp:3,app_home_regular_user:exp:A,memory_common:exp:enable,mainchat_moe:exp:300,assistant_greet_user:exp:greet_user,app_welcome_personalize:exp:A,assistant_model_exp_group:exp:glm4.5,ai_wallet:exp:ai_wallet_enable",
+  "X-Lang": "zh"
+};
+
+/**
+ * 获取伪装headers
+ */
+function getHeaders() {
+  const userAgent = _.sample(USER_AGENTS);
+  return {
+    ...FAKE_HEADERS,
+    "User-Agent": userAgent || USER_AGENTS[0]
+  };
+}
+
+// 文件最大大小
+const FILE_MAX_SIZE = 100 * 1024 * 1024;
+// access_token映射
+const accessTokenMap = new Map();
+// access_token请求队列映射
+const accessTokenRequestQueueMap: Record<string, Function[]> = {};
+
+/**
+ * 生成sign
+ */
+async function generateSign() {
+  // 智谱的时间戳算法（官网变化记得更新）
+  const e = Date.now()
+              , A = e.toString()
+              , t = A.length
+              , o = A.split("").map((e => Number(e)))
+              , i = o.reduce(( (e, A) => e + A), 0) - o[t - 2]
+              , a = i % 10;
+  const timestamp = A.substring(0, t - 2) + a + A.substring(t - 1, t);
+  // 随机UUID
+  const nonce = util.uuid(false);
+  // 签名
+  const sign = util.md5(`${timestamp}-${nonce}-${SIGN_SECRET}`);
+  return {
+    timestamp,
+    nonce,
+    sign
+  }
+}
+
+/**
+ * 请求access_token
+ *
+ * 使用refresh_token去刷新获得access_token
+ *
+ * @param refreshToken 用于刷新access_token的refresh_token
+ */
+async function requestToken(refreshToken: string) {
+  if (accessTokenRequestQueueMap[refreshToken])
+    return new Promise((resolve) =>
+      accessTokenRequestQueueMap[refreshToken].push(resolve)
+    );
+  accessTokenRequestQueueMap[refreshToken] = [];
+  logger.info(`Refresh token: ${refreshToken}`);
+  const result = await (async () => {
+    // 生成sign
+    const sign = await generateSign();
+    const result = await axios.post(
+      "https://chatglm.cn/chatglm/user-api/user/refresh",
+      {},
+      {
+        headers: {
+          // Referer: "https://chatglm.cn/main/alltoolsdetail",
+          Authorization: `Bearer ${refreshToken}`,
+          "Content-Type": "application/json",
+          ...getHeaders(),
+          "X-Device-Id": util.uuid(false),
+          "X-Nonce": sign.nonce,
+          "X-Request-Id": util.uuid(false),
+          "X-Sign": sign.sign,
+          "X-Timestamp": `${sign.timestamp}`,
+        },
+        timeout: 15000,
+        validateStatus: () => true,
+      }
+    );
+    const { result: _result } = checkResult(result, refreshToken);
+    const { access_token, refresh_token } = _result;
+    return {
+      accessToken: access_token,
+      refreshToken: refresh_token,
+      refreshTime: util.unixTimestamp() + ACCESS_TOKEN_EXPIRES,
+    };
+  })()
+    .then((result) => {
+      if (accessTokenRequestQueueMap[refreshToken]) {
+        accessTokenRequestQueueMap[refreshToken].forEach((resolve) =>
+          resolve(result)
+        );
+        delete accessTokenRequestQueueMap[refreshToken];
+      }
+      logger.success(`Refresh successful`);
+      return result;
+    })
+    .catch((err) => {
+      if (accessTokenRequestQueueMap[refreshToken]) {
+        accessTokenRequestQueueMap[refreshToken].forEach((resolve) =>
+          resolve(err)
+        );
+        delete accessTokenRequestQueueMap[refreshToken];
+      }
+      return err;
+    });
+  if (_.isError(result)) throw result;
+  return result;
+}
+
+/**
+ * 获取缓存中的access_token
+ *
+ * 避免短时间大量刷新token，未加锁，如果有并发要求还需加锁
+ *
+ * @param refreshToken 用于刷新access_token的refresh_token
+ */
+async function acquireToken(refreshToken: string): Promise<string> {
+  let result = accessTokenMap.get(refreshToken);
+  if (!result) {
+    result = await requestToken(refreshToken);
+    accessTokenMap.set(refreshToken, result);
+  }
+  if (util.unixTimestamp() > result.refreshTime) {
+    result = await requestToken(refreshToken);
+    accessTokenMap.set(refreshToken, result);
+  }
+  return result.accessToken;
+}
+
+/**
+ * 移除会话
+ *
+ * 在对话流传输完毕后移除会话，避免创建的会话出现在用户的对话列表中
+ *
+ * @param refreshToken 用于刷新access_token的refresh_token
+ */
+async function removeConversation(
+  convId: string,
+  refreshToken: string,
+  assistantId = DEFAULT_ASSISTANT_ID
+) {
+  const token = await acquireToken(refreshToken);
+  const sign = await generateSign();
+  const result = await axios.post(
+    "https://chatglm.cn/chatglm/backend-api/assistant/conversation/delete",
+    {
+      assistant_id: assistantId,
+      conversation_id: convId,
+    },
+    {
+      headers: {
+        Authorization: `Bearer ${token}`,
+        Referer: `https://chatglm.cn/main/alltoolsdetail`,
+        "X-Device-Id": util.uuid(false),
+        "X-Request-Id": util.uuid(false),
+        "X-Sign": sign.sign,
+        "X-Timestamp": sign.timestamp,
+        "X-Nonce": sign.nonce,
+        ...getHeaders(),
+      },
+      timeout: 15000,
+      validateStatus: () => true,
+    }
+  );
+  checkResult(result, refreshToken);
+}
+
+/**
+ * 同步对话补全
+ *
+ * @param messages 参考gpt系列消息格式，多轮对话请完整提供上下文
+ * @param refreshToken 用于刷新access_token的refresh_token
+ * @param model 智能体ID，默认使用GLM4原版
+ * @param retryCount 重试次数
+ */
+async function createCompletion(
+  messages: any[],
+  refreshToken: string,
+  model = MODEL_NAME,
+  refConvId = "",
+  retryCount = 0
+) {
+  return (async () => {
+    logger.info(messages);
+
+    // 提取引用文件URL并上传获得引用的文件ID列表
+    const refFileUrls = extractRefFileUrls(messages);
+    const refs = refFileUrls.length
+      ? await Promise.all(
+          refFileUrls.map((fileUrl) => uploadFile(fileUrl, refreshToken))
+        )
+      : [];
+
+    // 如果引用对话ID不正确则重置引用
+    if (!/[0-9a-zA-Z]{24}/.test(refConvId)) refConvId = "";
+
+    let assistantId = /^[a-z0-9]{24,}$/.test(model) ? model : DEFAULT_ASSISTANT_ID;
+    let chatMode = model === 'glm-5.3' ? 'deep_thinking' : '';
+
+    if(model.indexOf('think') != -1 || model.indexOf('zero') != -1) {
+      chatMode = 'zero';
+      logger.info('使用【推理】模型');
+    }
+    
+    if(model.indexOf('deepresearch') != -1) {
+      chatMode = 'deep_research';
+      logger.info('使用【沉思（DeepResearch）】模型');
+    }
+
+    // 请求流
+    const token = await acquireToken(refreshToken);
+    const sign = await generateSign();
+    const result = await axios.post(
+      "https://chatglm.cn/chatglm/backend-api/assistant/stream",
+      {
+        assistant_id: assistantId,
+        conversation_id: refConvId,
+        project_id: "",
+        chat_type: "user_chat",
+        messages: messagesPrepare(messages, refs, !!refConvId),
+        meta_data: {
+          channel: "",
+          chat_mode: chatMode || undefined,
+          draft_id: "",
+          if_plus_model: true,
+          input_question_type: "xxxx",
+          is_networking: true,
+          is_test: false,
+          platform: "pc",
+          quote_log_id: "",
+          ...(model === "glm-5.3" ? {
+            selected_model: "glm-5.3",
+            reasoning_effort: "max",
+          } : {}),
+          cogview: {
+            rm_label_watermark: false
+          }
+        },
+      },
+      {
+        headers: {
+          Authorization: `Bearer ${token}`,
+          ...getHeaders(),
+          "X-Device-Id": util.uuid(false),
+          "X-Request-Id": util.uuid(false),
+          "X-Sign": sign.sign,
+          "X-Timestamp": sign.timestamp,
+          "X-Nonce": sign.nonce,
+        },
+        // 120秒超时
+        timeout: 120000,
+        validateStatus: () => true,
+        responseType: "stream",
+      }
+    );
+    if (result.headers["content-type"].indexOf("text/event-stream") == -1) {
+      result.data.on("data", (buffer) => logger.error(buffer.toString()));
+      throw new APIException(
+        EX.API_REQUEST_FAILED,
+        `Stream response Content-Type invalid: ${result.headers["content-type"]}`
+      );
+    }
+
+    const streamStartTime = util.timestamp();
+    // 接收流为输出文本
+    const answer = await receiveStream(model, result.data);
+    logger.success(
+      `Stream has completed transfer ${util.timestamp() - streamStartTime}ms`
+    );
+
+    // 异步移除会话
+    removeConversation(answer.id, refreshToken, assistantId).catch(
+      (err) => !refConvId && console.error(err)
+    );
+
+    return answer;
+  })().catch((err) => {
+    if (retryCount < MAX_RETRY_COUNT) {
+      logger.error(`Stream response error: ${err.stack}`);
+      logger.warn(`Try again after ${RETRY_DELAY / 1000}s...`);
+      return (async () => {
+        await new Promise((resolve) => setTimeout(resolve, RETRY_DELAY));
+        return createCompletion(
+          messages,
+          refreshToken,
+          model,
+          refConvId,
+          retryCount + 1
+        );
+      })();
+    }
+    throw err;
+  });
+}
+
+/**
+ * 流式对话补全
+ *
+ * @param messages 参考gpt系列消息格式，多轮对话请完整提供上下文
+ * @param refreshToken 用于刷新access_token的refresh_token
+ * @param model 智能体ID，默认使用GLM4原版
+ * @param retryCount 重试次数
+ */
+async function createCompletionStream(
+  messages: any[],
+  refreshToken: string,
+  model = MODEL_NAME,
+  refConvId = "",
+  retryCount = 0
+) {
+  return (async () => {
+    logger.info(messages);
+
+    // 提取引用文件URL并上传获得引用的文件ID列表
+    const refFileUrls = extractRefFileUrls(messages);
+    const refs = refFileUrls.length
+      ? await Promise.all(
+          refFileUrls.map((fileUrl) => uploadFile(fileUrl, refreshToken))
+        )
+      : [];
+
+    // 如果引用对话ID不正确则重置引用
+    if (!/[0-9a-zA-Z]{24}/.test(refConvId)) refConvId = "";
+
+    let assistantId = /^[a-z0-9]{24,}$/.test(model) ? model : DEFAULT_ASSISTANT_ID;
+    let chatMode = model === 'glm-5.3' ? 'deep_thinking' : 'zero';
+
+    if(model.indexOf('think') != -1 || model.indexOf('zero') != -1) {
+      chatMode = 'zero';
+      logger.info('使用【推理】模型');
+    }
+
+    if(model.indexOf('deepresearch') != -1) {
+      chatMode = 'deep_research';
+      logger.info('使用【沉思（DeepResearch）】模型');
+    }
+
+    // 请求流
+    const token = await acquireToken(refreshToken);
+    const sign = await generateSign();
+    const result = await axios.post(
+      `https://chatglm.cn/chatglm/backend-api/assistant/stream`,
+      {
+        assistant_id: assistantId,
+        conversation_id: refConvId,
+        project_id: "",
+        chat_type: "user_chat",
+        messages: messagesPrepare(messages, refs, !!refConvId),
+        meta_data: {
+          channel: "",
+          chat_mode: chatMode || undefined,
+          draft_id: "",
+          if_plus_model: true,
+          input_question_type: "xxxx",
+          is_networking: true,
+          is_test: false,
+          platform: "pc",
+          quote_log_id: "",
+          ...(model === "glm-5.3" ? {
+            selected_model: "glm-5.3",
+            reasoning_effort: "max",
+          } : {}),
+          cogview: {
+            rm_label_watermark: false
+          }
+        },
+      },
+      {
+        headers: {
+          Authorization: `Bearer ${token}`,
+          Referer:
+            assistantId == DEFAULT_ASSISTANT_ID
+              ? "https://chatglm.cn/main/alltoolsdetail"
+              : `https://chatglm.cn/main/gdetail/${assistantId}`,
+          "X-Device-Id": util.uuid(false),
+          "X-Request-Id": util.uuid(false),
+          "X-Sign": sign.sign,
+          "X-Timestamp": sign.timestamp,
+          "X-Nonce": sign.nonce,
+          ...getHeaders(),
+        },
+        // 120秒超时
+        timeout: 120000,
+        validateStatus: () => true,
+        responseType: "stream",
+      }
+    );
+
+    if (result.headers["content-type"].indexOf("text/event-stream") == -1) {
+      logger.error(
+        `Invalid response Content-Type:`,
+        result.headers["content-type"]
+      );
+      result.data.on("data", (buffer) => logger.error(buffer.toString()));
+      const transStream = new PassThrough();
+      transStream.end(
+        `data: ${JSON.stringify({
+          id: "",
+          model: MODEL_NAME,
+          object: "chat.completion.chunk",
+          choices: [
+            {
+              index: 0,
+              delta: {
+                role: "assistant",
+                content: "服务暂时不可用，第三方响应错误",
+              },
+              finish_reason: "stop",
+            },
+          ],
+          usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+          created: util.unixTimestamp(),
+        })}\n\n`
+      );
+      return transStream;
+    }
+
+    const streamStartTime = util.timestamp();
+    // 创建转换流将消息格式转换为gpt兼容格式
+    return createTransStream(model, result.data, (convId: string) => {
+      logger.success(
+        `Stream has completed transfer ${util.timestamp() - streamStartTime}ms`
+      );
+      // 流传输结束后异步移除会话
+      removeConversation(convId, refreshToken, assistantId).catch(
+        (err) => !refConvId && console.error(err)
+      );
+    });
+  })().catch((err) => {
+    if (retryCount < MAX_RETRY_COUNT) {
+      logger.error(`Stream response error: ${err.stack}`);
+      logger.warn(`Try again after ${RETRY_DELAY / 1000}s...`);
+      return (async () => {
+        await new Promise((resolve) => setTimeout(resolve, RETRY_DELAY));
+        return createCompletionStream(
+          messages,
+          refreshToken,
+          model,
+          refConvId,
+          retryCount + 1
+        );
+      })();
+    }
+    throw err;
+  });
+}
+
+async function generateImages(
+  model = "65a232c082ff90a2ad2f15e2",
+  prompt: string,
+  refreshToken: string,
+  retryCount = 0
+) {
+  return (async () => {
+    logger.info(prompt);
+    const messages = [
+      {
+        role: "user",
+        content: prompt.indexOf("画") == -1 ? `请画：${prompt}` : prompt,
+      },
+    ];
+    // 请求流
+    const token = await acquireToken(refreshToken);
+    const sign = await generateSign();
+    const result = await axios.post(
+      "https://chatglm.cn/chatglm/backend-api/assistant/stream",
+      {
+        assistant_id: model,
+        conversation_id: "",
+        messages: messagesPrepare(messages, []),
+        meta_data: {
+          channel: "",
+          draft_id: "",
+          if_plus_model: true,
+          input_question_type: "xxxx",
+          is_test: false,
+          platform: "pc",
+          quote_log_id: ""
+        },
+      },
+      {
+        headers: {
+          Authorization: `Bearer ${token}`,
+          Referer: `https://chatglm.cn/main/gdetail/${model}`,
+          "X-Device-Id": util.uuid(false),
+          "X-Request-Id": util.uuid(false),
+          "X-Sign": sign.sign,
+          "X-Timestamp": sign.timestamp,
+          "X-Nonce": sign.nonce,
+          ...getHeaders(),
+        },
+        // 120秒超时
+        timeout: 120000,
+        validateStatus: () => true,
+        responseType: "stream",
+      }
+    );
+
+    if (result.headers["content-type"].indexOf("text/event-stream") == -1)
+      throw new APIException(
+        EX.API_REQUEST_FAILED,
+        `Stream response Content-Type invalid: ${result.headers["content-type"]}`
+      );
+
+    const streamStartTime = util.timestamp();
+    // 接收流为输出文本
+    const { convId, imageUrls } = await receiveImages(result.data);
+    logger.success(
+      `Stream has completed transfer ${util.timestamp() - streamStartTime}ms`
+    );
+
+    // 异步移除会话，如果消息不合规，此操作可能会抛出数据库错误异常，请忽略
+    removeConversation(convId, refreshToken, model).catch((err) =>
+      console.error(err)
+    );
+
+    if (imageUrls.length == 0)
+      throw new APIException(EX.API_IMAGE_GENERATION_FAILED);
+
+    return imageUrls;
+  })().catch((err) => {
+    if (retryCount < MAX_RETRY_COUNT) {
+      logger.error(`Stream response error: ${err.message}`);
+      logger.warn(`Try again after ${RETRY_DELAY / 1000}s...`);
+      return (async () => {
+        await new Promise((resolve) => setTimeout(resolve, RETRY_DELAY));
+        return generateImages(model, prompt, refreshToken, retryCount + 1);
+      })();
+    }
+    throw err;
+  });
+}
+
+async function generateVideos(
+  model = "cogvideox",
+  prompt: string,
+  refreshToken: string,
+  options: {
+    imageUrl: string;
+    videoStyle: string;
+    emotionalAtmosphere: string;
+    mirrorMode: string;
+    audioId: string;
+  },
+  refConvId = "",
+  retryCount = 0
+) {
+  return (async () => {
+    logger.info(prompt);
+
+    // 如果引用对话ID不正确则重置引用
+    if (!/[0-9a-zA-Z]{24}/.test(refConvId)) refConvId = "";
+
+    const sourceList = [];
+    if (model == "cogvideox-pro") {
+      const imageUrls = await generateImages(undefined, prompt, refreshToken);
+      options.imageUrl = imageUrls[0];
+    }
+    if (options.imageUrl) {
+      const { source_id: sourceId } = await uploadFile(
+        options.imageUrl,
+        refreshToken,
+        true
+      );
+      sourceList.push(sourceId);
+    }
+
+    // 发起生成请求
+    let token = await acquireToken(refreshToken);
+    const sign = await generateSign();
+    const result = await axios.post(
+      `https://chatglm.cn/chatglm/video-api/v1/chat`,
+      {
+        conversation_id: refConvId,
+        prompt,
+        source_list: sourceList.length > 0 ? sourceList : undefined,
+        advanced_parameter_extra: {
+          emotional_atmosphere: options.emotionalAtmosphere,
+          mirror_mode: options.mirrorMode,
+          video_style: options.videoStyle,
+        },
+      },
+      {
+        headers: {
+          Authorization: `Bearer ${token}`,
+          Referer: "https://chatglm.cn/video",
+          "X-Device-Id": util.uuid(false),
+          "X-Request-Id": util.uuid(false),
+          "X-Sign": sign.sign,
+          "X-Timestamp": sign.timestamp,
+          "X-Nonce": sign.nonce,
+          ...getHeaders(),
+        },
+        // 30秒超时
+        timeout: 30000,
+        validateStatus: () => true,
+      }
+    );
+    const { result: _result } = checkResult(result, refreshToken);
+    const { chat_id: chatId, conversation_id: convId } = _result;
+
+    // 轮询生成进度
+    const startTime = util.unixTimestamp();
+    const results = [];
+    while (true) {
+      if (util.unixTimestamp() - startTime > 600)
+        throw new APIException(EX.API_VIDEO_GENERATION_FAILED);
+      const token = await acquireToken(refreshToken);
+      const sign = await generateSign();
+      const result = await axios.get(
+        `https://chatglm.cn/chatglm/video-api/v1/chat/status/${chatId}`,
+        {
+          headers: {
+            Authorization: `Bearer ${token}`,
+            Referer: "https://chatglm.cn/video",
+            "X-Device-Id": util.uuid(false),
+            "X-Request-Id": util.uuid(false),
+            "X-Sign": sign.sign,
+            "X-Timestamp": sign.timestamp,
+            "X-Nonce": sign.nonce,
+            ...getHeaders(),
+          },
+          // 30秒超时
+          timeout: 30000,
+          validateStatus: () => true,
+        }
+      );
+      const { result: _result } = checkResult(result, refreshToken);
+      const {
+        status,
+        msg,
+        plan,
+        cover_url,
+        video_url,
+        video_duration,
+        resolution,
+      } = _result;
+      if (status != "init" && status != "processing") {
+        if (status != "finished")
+          throw new APIException(EX.API_VIDEO_GENERATION_FAILED);
+        let videoUrl = video_url;
+        if (options.audioId) {
+          const [key, id] = options.audioId.split("-");
+          const token = await acquireToken(refreshToken);
+          const sign = await generateSign();
+          const result = await axios.post(
+            `https://chatglm.cn/chatglm/video-api/v1/static/composite_video`,
+            {
+              chat_id: chatId,
+              key,
+              audio_id: id,
+            },
+            {
+              headers: {
+                Authorization: `Bearer ${token}`,
+                Referer: "https://chatglm.cn/video",
+                "X-Device-Id": util.uuid(false),
+                "X-Request-Id": util.uuid(false),
+                "X-Sign": sign.sign,
+                "X-Timestamp": sign.timestamp,
+                "X-Nonce": sign.nonce,
+                ...getHeaders(),
+              },
+              // 30秒超时
+              timeout: 30000,
+              validateStatus: () => true,
+            }
+          );
+          const { result: _result } = checkResult(result, refreshToken);
+          videoUrl = _result.url;
+        }
+        results.push({
+          conversation_id: convId,
+          cover_url,
+          video_url: videoUrl,
+          video_duration,
+          resolution,
+        });
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+    }
+
+    //https://chatglm.cn/chatglm/video-api/v1/reference/audio_group
+
+    axios
+      .delete(`https://chatglm.cn/chatglm/video-api/v1/chat/${chatId}`, {
+        headers: {
+          Authorization: `Bearer ${token}`,
+          Referer: "https://chatglm.cn/video",
+          "X-Device-Id": util.uuid(false),
+          "X-Request-Id": util.uuid(false),
+          ...getHeaders(),
+        },
+        validateStatus: () => true,
+      })
+      .catch((err) => logger.error("移除视频生成记录失败：", err));
+
+    return results;
+  })().catch((err) => {
+    if (retryCount < MAX_RETRY_COUNT) {
+      logger.error(`Video generation error: ${err.message}`);
+      logger.warn(`Try again after ${RETRY_DELAY / 1000}s...`);
+      return (async () => {
+        await new Promise((resolve) => setTimeout(resolve, RETRY_DELAY));
+        return generateVideos(
+          model,
+          prompt,
+          refreshToken,
+          options,
+          refConvId,
+          retryCount + 1
+        );
+      })();
+    }
+    throw err;
+  });
+}
+
+/**
+ * 提取消息中引用的文件URL
+ *
+ * @param messages 参考gpt系列消息格式，多轮对话请完整提供上下文
+ */
+function extractRefFileUrls(messages: any[]) {
+  const urls = [];
+  // 如果没有消息，则返回[]
+  if (!messages.length) {
+    return urls;
+  }
+  // 只获取最新的消息
+  const lastMessage = messages[messages.length - 1];
+  if (_.isArray(lastMessage.content)) {
+    lastMessage.content.forEach((v) => {
+      if (!_.isObject(v) || !["file", "image_url"].includes(v["type"])) return;
+      // glm-free-api支持格式
+      if (
+        v["type"] == "file" &&
+        _.isObject(v["file_url"]) &&
+        _.isString(v["file_url"]["url"])
+      )
+        urls.push(v["file_url"]["url"]);
+      // 兼容gpt-4-vision-preview API格式
+      else if (
+        v["type"] == "image_url" &&
+        _.isObject(v["image_url"]) &&
+        _.isString(v["image_url"]["url"])
+      )
+        urls.push(v["image_url"]["url"]);
+    });
+  }
+  logger.info("本次请求上传：" + urls.length + "个文件");
+  return urls;
+}
+
+/**
+ * 消息预处理
+ *
+ * 由于接口只取第一条消息，此处会将多条消息合并为一条，实现多轮对话效果
+ *
+ * @param messages 参考gpt系列消息格式，多轮对话请完整提供上下文
+ * @param refs 参考文件列表
+ * @param isRefConv 是否为引用会话
+ */
+function messagesPrepare(messages: any[], refs: any[], isRefConv = false) {
+  let content;
+  if (isRefConv || messages.length < 2) {
+    content = messages.reduce((content, message) => {
+      if (_.isArray(message.content)) {
+        return message.content.reduce((_content, v) => {
+          if (!_.isObject(v) || v["type"] != "text") return _content;
+          return _content + (v["text"] || "") + "\n";
+        }, content);
+      }
+      return content + `${message.content}\n`;
+    }, "");
+    logger.info("\n透传内容：\n" + content);
+  } else {
+    // 检查最新消息是否含有"type": "image_url"或"type": "file",如果有则注入消息
+    let latestMessage = messages[messages.length - 1];
+    let hasFileOrImage =
+      Array.isArray(latestMessage.content) &&
+      latestMessage.content.some(
+        (v) =>
+          typeof v === "object" && ["file", "image_url"].includes(v["type"])
+      );
+    if (hasFileOrImage) {
+      let newFileMessage = {
+        content: "关注用户最新发送文件和消息",
+        role: "system",
+      };
+      messages.splice(messages.length - 1, 0, newFileMessage);
+      logger.info("注入提升尾部文件注意力system prompt");
+    } else {
+      // 由于注入会导致设定污染，暂时注释
+      // let newTextMessage = {
+      //   content: "关注用户最新的消息",
+      //   role: "system",
+      // };
+      // messages.splice(messages.length - 1, 0, newTextMessage);
+      // logger.info("注入提升尾部消息注意力system prompt");
+    }
+    content = (
+      messages.reduce((content, message) => {
+        const role = message.role
+          .replace("system", "<|sytstem|>")
+          .replace("assistant", "<|assistant|>")
+          .replace("user", "<|user|>");
+        if (_.isArray(message.content)) {
+          return message.content.reduce((_content, v) => {
+            if (!_.isObject(v) || v["type"] != "text") return _content;
+            return _content + (`${role}\n` + v["text"] || "") + "\n";
+          }, content);
+        }
+        return (content += `${role}\n${message.content}\n`);
+      }, "") + "<|assistant|>\n"
+    )
+      // 移除MD图像URL避免幻觉
+      .replace(/\!\[.+\]\(.+\)/g, "")
+      // 移除临时路径避免在新会话引发幻觉
+      .replace(/\/mnt\/data\/.+/g, "");
+    logger.info("\n对话合并：\n" + content);
+  }
+
+  const fileRefs = refs.filter((ref) => !ref.width && !ref.height);
+  const imageRefs = refs
+    .filter((ref) => ref.width || ref.height)
+    .map((ref) => {
+      ref.image_url = ref.file_url;
+      return ref;
+    });
+  return [
+    {
+      role: "user",
+      content: [
+        { type: "text", text: content },
+        ...(fileRefs.length == 0
+          ? []
+          : [
+              {
+                type: "file",
+                file: fileRefs,
+              },
+            ]),
+        ...(imageRefs.length == 0
+          ? []
+          : [
+              {
+                type: "image",
+                image: imageRefs,
+              },
+            ]),
+      ],
+    },
+  ];
+}
+
+/**
+ * 预检查文件URL有效性
+ *
+ * @param fileUrl 文件URL
+ */
+async function checkFileUrl(fileUrl: string) {
+  if (util.isBASE64Data(fileUrl)) return;
+  const result = await axios.head(fileUrl, {
+    timeout: 15000,
+    validateStatus: () => true,
+  });
+  if (result.status >= 400)
+    throw new APIException(
+      EX.API_FILE_URL_INVALID,
+      `File ${fileUrl} is not valid: [${result.status}] ${result.statusText}`
+    );
+  // 检查文件大小
+  if (result.headers && result.headers["content-length"]) {
+    const fileSize = parseInt(result.headers["content-length"], 10);
+    if (fileSize > FILE_MAX_SIZE)
+      throw new APIException(
+        EX.API_FILE_EXECEEDS_SIZE,
+        `File ${fileUrl} is not valid`
+      );
+  }
+}
+
+/**
+ * 上传文件
+ *
+ * @param fileUrl 文件URL
+ * @param refreshToken 用于刷新access_token的refresh_token
+ * @param isVideoImage 是否是用于视频图像
+ */
+async function uploadFile(
+  fileUrl: string,
+  refreshToken: string,
+  isVideoImage: boolean = false
+) {
+  // 预检查远程文件URL可用性
+  await checkFileUrl(fileUrl);
+
+  let filename, fileData, mimeType;
+  // 如果是BASE64数据则直接转换为Buffer
+  if (util.isBASE64Data(fileUrl)) {
+    mimeType = util.extractBASE64DataFormat(fileUrl);
+    const ext = mime.getExtension(mimeType);
+    filename = `${util.uuid()}.${ext}`;
+    fileData = Buffer.from(util.removeBASE64DataHeader(fileUrl), "base64");
+  }
+  // 下载文件到内存，如果您的服务器内存很小，建议考虑改造为流直传到下一个接口上，避免停留占用内存
+  else {
+    filename = path.basename(fileUrl);
+    ({ data: fileData } = await axios.get(fileUrl, {
+      responseType: "arraybuffer",
+      // 100M限制
+      maxContentLength: FILE_MAX_SIZE,
+      // 60秒超时
+      timeout: 60000,
+    }));
+  }
+
+  // 获取文件的MIME类型
+  mimeType = mimeType || mime.getType(filename);
+
+  if (isVideoImage) {
+    const im = sharp(fileData).resize(1440, null, {
+      fit: "inside", // 保持宽高比
+    });
+    const metadata = await im.metadata();
+    const cropHeight = metadata.height > 960 ? 960 : metadata.height;
+    fileData = await im
+      .extract({
+        width: 1440,
+        height: cropHeight,
+        left: 0,
+        top: (metadata.height - cropHeight) / 2,
+      })
+      .toBuffer();
+  }
+
+  const formData = new FormData();
+  formData.append("file", fileData, {
+    filename,
+    contentType: mimeType,
+  });
+
+  // 上传文件到目标OSS
+  const token = await acquireToken(refreshToken);
+  let result = await axios.request({
+    method: "POST",
+    url: isVideoImage
+      ? "https://chatglm.cn/chatglm/video-api/v1/static/upload"
+      : "https://chatglm.cn/chatglm/backend-api/assistant/file_upload",
+    data: formData,
+    // 100M限制
+    maxBodyLength: FILE_MAX_SIZE,
+    // 60秒超时
+    timeout: 60000,
+    headers: {
+      Authorization: `Bearer ${token}`,
+      Referer: isVideoImage
+        ? "https://chatglm.cn/video"
+        : "https://chatglm.cn/",
+      ...getHeaders(),
+      ...formData.getHeaders(),
+    },
+    validateStatus: () => true,
+  });
+  const { result: uploadResult } = checkResult(result, refreshToken);
+
+  return uploadResult;
+}
+
+/**
+ * 检查请求结果
+ *
+ * @param result 结果
+ */
+function checkResult(result: AxiosResponse, refreshToken: string) {
+  if (!result.data) return null;
+  const { code, status, message } = result.data;
+  if (!_.isFinite(code) && !_.isFinite(status)) return result.data;
+  if (code === 0 || status === 0) return result.data;
+  if (code == 401) accessTokenMap.delete(refreshToken);
+  if (message.includes('40102')) {
+    throw new APIException(EX.API_REQUEST_FAILED, `[请求glm失败]: 您的refresh_token已过期，请重新登录获取`);
+  }
+  throw new APIException(EX.API_REQUEST_FAILED, `[请求glm失败]: ${message}`);
+}
+
+/**
+ * 从流接收完整的消息内容
+ *
+ * @param model 模型
+ * @param stream 消息流
+ */
+async function receiveStream(model: string, stream: any): Promise<any> {
+  return new Promise((resolve, reject) => {
+    // 消息初始化
+    const data = {
+      id: "",
+      model,
+      object: "chat.completion",
+      choices: [
+        {
+          index: 0,
+          message: { role: "assistant", content: "", reasoning_content: null },
+          finish_reason: "stop",
+        },
+      ],
+      usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+      created: util.unixTimestamp(),
+    };
+    const isSilentModel = model.indexOf('silent') != -1;
+    const isThinkModel = model.indexOf('think') != -1 || model.indexOf('zero') != -1;
+    const cachedParts: any[] = []; // 缓存所有逻辑段落
+
+    logger.info(`是否静默模型: ${isSilentModel}`);
+    const parser = createParser((event) => {
+      try {
+        if (event.type !== "event") return;
+        // 解析JSON
+        const result = _.attempt(() => JSON.parse(event.data));
+        if (_.isError(result))
+          throw new Error(`Stream response invalid: ${event.data}`);
+        if (!data.id && result.conversation_id)
+          data.id = result.conversation_id;
+
+        if (result.status != "finish") {
+            // 更新缓存的parts
+            if (result.parts) {
+              // 深度优化：假定 upstream 发送的是全量 parts 列表 (Snapshot)，直接替换缓存
+              // 这样可以避免因 logic_id 变更或合并导致的重复/幽灵内容问题
+              cachedParts.length = 0;
+              cachedParts.push(...result.parts);
+            }
+
+            // 1. Collect Search Results
+            const searchMap = new Map<string, any>();
+            cachedParts.forEach((part) => {
+                if (!part.content || !_.isArray(part.content)) return;
+                const { meta_data } = part;
+                part.content.forEach((item: any) => {
+                     if (
+                          item.type == "tool_result" &&
+                          meta_data?.tool_result_extra?.search_results
+                        ) {
+                           meta_data.tool_result_extra.search_results.forEach((res: any) => {
+                               if (res.match_key) {
+                                   searchMap.set(res.match_key, res);
+                               }
+                           });
+                        }
+                });
+            });
+
+            // 2. Prepare for renumbering
+            const keyToIdMap = new Map<string, number>();
+            let counter = 1;
+
+            // 全量重建所有 parts 的文本和思考内容
+            let fullText = "";
+            let fullReasoning = "";
+
+            cachedParts.forEach((part: any) => {
+                const { content, meta_data } = part;
+                if (!_.isArray(content)) return;
+
+                let partText = "";
+                let partReasoning = "";
+
+                // 处理每个 part 的内容
+                content.forEach((value: any) => {
+                    const {
+                      type,
+                      text,
+                      think,
+                      image,
+                      code,
+                      content: innerContent,
+                    } = value;
+
+                    if (type == "text") {
+                        let txt = text;
+                        if (searchMap.size > 0) {
+                             // Match any turnXsearchY pattern, with optional brackets
+                             txt = txt.replace(/【?(turn\d+[a-zA-Z]+\d+)】?/g, (match: string, key: string) => {
+                                 const searchInfo = searchMap.get(key);
+                                 if (!searchInfo) {
+                                     return match; // Keep original if not found
+                                 }
+
+                                 // Assign new ID if not exists
+                                 if (!keyToIdMap.has(key)) {
+                                     keyToIdMap.set(key, counter++);
+                                 }
+                                 const newId = keyToIdMap.get(key);
+
+                                 return ` [${newId}](${searchInfo.url})`;
+                             });
+                        }
+                        partText += txt;
+                    } else if (type == "think" && !isSilentModel) {
+                        partReasoning += think;
+                    } else if (
+                      type == "tool_result" &&
+                      meta_data &&
+                      meta_data.tool_result_extra &&
+                      _.isArray(meta_data.tool_result_extra.search_results) &&
+                      !isSilentModel
+                    ) {
+                       const searchText = meta_data.tool_result_extra.search_results.reduce(
+                          (meta: string, v: any) => meta + `> 检索 ${v.title}(${v.url}) ...\n`,
+                          ""
+                       );
+                       partReasoning += searchText;
+                    } else if (
+                      type == "quote_result" &&
+                      part.status == "finish" &&
+                      meta_data &&
+                      _.isArray(meta_data.metadata_list) &&
+                      !isSilentModel
+                    ) {
+                       const searchText = meta_data.metadata_list.reduce(
+                          (meta: string, v: any) => meta + `> 检索 ${v.title}(${v.url}) ...\n`,
+                          ""
+                       );
+                       partReasoning += searchText;
+                    } else if (
+                      type == "image" &&
+                      _.isArray(image) &&
+                      part.status == "finish"
+                    ) {
+                      const imageText = image.reduce(
+                        (imgs: string, v: any) =>
+                          imgs +
+                          (/^(http|https):\/\//.test(v.image_url)
+                            ? `![图像](${v.image_url || ""})`
+                            : ""),
+                        ""
+                      ) + "\n";
+                      partText += imageText;
+                    } else if (type == "code") {
+                       // 代码块处理：始终包裹
+                       partText += "```python\n" + code + (part.status == "finish" ? "\n```\n" : "");
+                    } else if (
+                      type == "execution_output" &&
+                      _.isString(innerContent) &&
+                      part.status == "finish"
+                    ) {
+                      partText += innerContent + "\n";
+                    }
+                });
+
+                if (partText) {
+                  fullText += (fullText.length > 0 ? "\n" : "") + partText;
+                }
+                if (partReasoning) {
+                  fullReasoning += (fullReasoning.length > 0 ? "\n" : "") + partReasoning;
+                }
+            });
+
+            data.choices[0].message.content = fullText;
+            (data.choices[0].message as any).reasoning_content = fullReasoning || null;
+        } else {
+          data.choices[0].message.content =
+            data.choices[0].message.content.replace(
+              /【\d+†(来源|源|source)】/g,
+              ""
+            );
+          resolve(data);
+        }
+      } catch (err) {
+        logger.error(err);
+        reject(err);
+      }
+    });
+    // 将流数据喂给SSE转换器
+    stream.on("data", (buffer) => parser.feed(buffer.toString()));
+    stream.once("error", (err) => reject(err));
+    stream.once("close", () => resolve(data));
+  });
+}
+
+/**
+ * 创建转换流
+ *
+ * 将流格式转换为gpt兼容流格式
+ *
+ * @param model 模型
+ * @param stream 消息流
+ * @param endCallback 传输结束回调
+ */
+function createTransStream(model: string, stream: any, endCallback?: Function) {
+  // 消息创建时间
+  const created = util.unixTimestamp();
+  // 创建转换流
+  const transStream = new PassThrough();
+  const isSilentModel = model.indexOf('silent') != -1;
+  const isThinkModel = model.indexOf('think') != -1 || model.indexOf('zero') != -1;
+  let sentContent = ""; // 记录已发送给客户端的完整内容
+  let sentReasoning = ""; // 记录已发送给客户端的完整思考内容
+  const cachedParts: any[] = []; // 缓存所有逻辑段落
+
+  !transStream.closed &&
+    transStream.write(
+      `data: ${JSON.stringify({
+        id: "",
+        model,
+        object: "chat.completion.chunk",
+        choices: [
+          {
+            index: 0,
+            delta: { role: "assistant", content: "" },
+            finish_reason: null,
+          },
+        ],
+        created,
+      })}\n\n`
+    );
+  const parser = createParser((event) => {
+    try {
+      if (event.type !== "event") return;
+      // 解析JSON
+      const result = _.attempt(() => JSON.parse(event.data));
+      if (_.isError(result))
+        throw new Error(`Stream response invalid: ${event.data}`);
+      if (result.status != "finish" && result.status != "intervene") {
+        // 更新缓存的parts
+        if (result.parts) {
+          result.parts.forEach((part: any) => {
+            const index = cachedParts.findIndex((p) => p.logic_id === part.logic_id);
+            if (index !== -1) {
+              cachedParts[index] = part;
+            } else {
+              cachedParts.push(part);
+            }
+          });
+        }
+
+        // 1. Collect Search Results
+        const searchMap = new Map<string, any>();
+        cachedParts.forEach((part) => {
+            if (!part.content || !_.isArray(part.content)) return;
+            const { meta_data } = part;
+            part.content.forEach((item: any) => {
+                 if (
+                      item.type == "tool_result" &&
+                      meta_data?.tool_result_extra?.search_results
+                    ) {
+                       meta_data.tool_result_extra.search_results.forEach((res: any) => {
+                           if (res.match_key) {
+                               searchMap.set(res.match_key, res);
+                           }
+                       });
+                    }
+            });
+        });
+
+        // 2. Prepare for renumbering
+        const keyToIdMap = new Map<string, number>();
+        let counter = 1;
+
+        // 全量重建所有 parts 的文本和思考内容
+        let fullText = "";
+        let fullReasoning = "";
+
+        cachedParts.forEach((part: any) => {
+            const { content, meta_data } = part;
+            if (!_.isArray(content)) return;
+
+            let partText = "";
+            let partReasoning = "";
+
+            // 处理每个 part 的内容
+            content.forEach((value: any) => {
+                const {
+                  type,
+                  text,
+                  think,
+                  image,
+                  code,
+                  content: innerContent,
+                } = value;
+
+                if (type == "text") {
+                    let txt = text;
+                    if (searchMap.size > 0) {
+                         // Match any turnXsearchY pattern, with optional brackets
+                         txt = txt.replace(/【?(turn\d+[a-zA-Z]+\d+)】?/g, (match: string, key: string) => {
+                             const searchInfo = searchMap.get(key);
+                             if (!searchInfo) {
+                                 return match; // Keep original if not found
+                             }
+
+                             // Assign new ID if not exists
+                             if (!keyToIdMap.has(key)) {
+                                 keyToIdMap.set(key, counter++);
+                             }
+                             const newId = keyToIdMap.get(key);
+
+                             return ` [${newId}](${searchInfo.url})`;
+                         });
+                    }
+                    partText += txt;
+                } else if (type == "think" && !isSilentModel) {
+                    partReasoning += think;
+                } else if (
+                  type == "tool_result" &&
+                  meta_data &&
+                  meta_data.tool_result_extra &&
+                  _.isArray(meta_data.tool_result_extra.search_results) &&
+                  !isSilentModel
+                ) {
+                   const searchText = meta_data.tool_result_extra.search_results.reduce(
+                      (meta: string, v: any) => meta + `> 检索 ${v.title}(${v.url}) ...\n`,
+                      ""
+                   );
+                   partReasoning += searchText;
+                } else if (
+                  type == "quote_result" &&
+                  part.status == "finish" &&
+                  meta_data &&
+                  _.isArray(meta_data.metadata_list) &&
+                  !isSilentModel
+                ) {
+                   const searchText = meta_data.metadata_list.reduce(
+                      (meta: string, v: any) => meta + `> 检索 ${v.title}(${v.url}) ...\n`,
+                      ""
+                   );
+                   partReasoning += searchText;
+                } else if (
+                  type == "image" &&
+                  _.isArray(image) &&
+                  part.status == "finish"
+                ) {
+                  const imageText = image.reduce(
+                    (imgs: string, v: any) =>
+                      imgs +
+                      (/^(http|https):\/\//.test(v.image_url)
+                        ? `![图像](${v.image_url || ""})`
+                        : ""),
+                    ""
+                  ) + "\n";
+                  partText += imageText;
+                } else if (type == "code") {
+                   // 代码块处理：始终包裹
+                   partText += "```python\n" + code + (part.status == "finish" ? "\n```\n" : "");
+                } else if (
+                  type == "execution_output" &&
+                  _.isString(innerContent) &&
+                  part.status == "finish"
+                ) {
+                  partText += innerContent + "\n";
+                }
+            });
+
+            if (partText) {
+              fullText += (fullText.length > 0 ? "\n" : "") + partText;
+            }
+            if (partReasoning) {
+              fullReasoning += (fullReasoning.length > 0 ? "\n" : "") + partReasoning;
+            }
+        });
+
+        // 计算思考内容增量
+        const reasoningChunk = fullReasoning.substring(sentReasoning.length);
+        if (reasoningChunk) {
+          sentReasoning += reasoningChunk;
+          const data = `data: ${JSON.stringify({
+            id: result.conversation_id,
+            model: MODEL_NAME,
+            object: "chat.completion.chunk",
+            choices: [
+              { index: 0, delta: { reasoning_content: reasoningChunk }, finish_reason: null },
+            ],
+            created,
+          })}\n\n`;
+          !transStream.closed && transStream.write(data);
+        }
+
+        // 计算内容增量
+        const chunk = fullText.substring(sentContent.length);
+        if (chunk) {
+          sentContent += chunk;
+          const data = `data: ${JSON.stringify({
+            id: result.conversation_id,
+            model: MODEL_NAME,
+            object: "chat.completion.chunk",
+            choices: [
+              { index: 0, delta: { content: chunk }, finish_reason: null },
+            ],
+            created,
+          })}\n\n`;
+          !transStream.closed && transStream.write(data);
+        }
+      } else {
+        const data = `data: ${JSON.stringify({
+          id: result.conversation_id,
+          model: MODEL_NAME,
+          object: "chat.completion.chunk",
+          choices: [
+            {
+              index: 0,
+              delta:
+                result.status == "intervene" &&
+                result.last_error &&
+                result.last_error.intervene_text
+                  ? { content: `\n\n${result.last_error.intervene_text}` }
+                  : {},
+              finish_reason: "stop",
+            },
+          ],
+          usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+          created,
+        })}\n\n`;
+        !transStream.closed && transStream.write(data);
+        !transStream.closed && transStream.end("data: [DONE]\n\n");
+        sentContent = "";
+        endCallback && endCallback(result.conversation_id);
+      }
+    } catch (err) {
+      logger.error(err);
+      !transStream.closed && transStream.end("\n\n");
+    }
+  });
+  // 将流数据喂给SSE转换器
+  // 深度优化：使用 TextDecoder 处理 buffer，防止多字节字符被截断
+  const decoder = new TextDecoder("utf-8");
+  stream.on("data", (buffer) => parser.feed(decoder.decode(buffer, { stream: true })));
+  stream.once(
+    "error",
+    () => !transStream.closed && transStream.end("data: [DONE]\n\n")
+  );
+  stream.once(
+    "close",
+    () => !transStream.closed && transStream.end("data: [DONE]\n\n")
+  );
+  return transStream;
+}
+
+/**
+ * 从流接收图像
+ *
+ * @param stream 消息流
+ */
+async function receiveImages(
+  stream: any
+): Promise<{ convId: string; imageUrls: string[] }> {
+  return new Promise((resolve, reject) => {
+    let convId = "";
+    const imageUrls = [];
+    const parser = createParser((event) => {
+      try {
+        if (event.type !== "event") return;
+        // 解析JSON
+        const result = _.attempt(() => JSON.parse(event.data));
+        if (_.isError(result))
+          throw new Error(`Stream response invalid: ${event.data}`);
+        if (!convId && result.conversation_id) convId = result.conversation_id;
+        if (result.status == "intervene")
+          throw new APIException(EX.API_CONTENT_FILTERED);
+        if (result.status != "finish") {
+          result.parts.forEach((part) => {
+            const { status: partStatus, content } = part;
+            if (!_.isArray(content)) return;
+            content.forEach((value) => {
+              const { type, image, text } = value;
+              if (
+                type == "image" &&
+                _.isArray(image) &&
+                partStatus == "finish"
+              ) {
+                image.forEach((value) => {
+                  if (
+                    !/^(http|https):\/\//.test(value.image_url) ||
+                    imageUrls.indexOf(value.image_url) != -1
+                  )
+                    return;
+                  imageUrls.push(value.image_url);
+                });
+              }
+              if (type == "text" && partStatus == "finish") {
+                const urlPattern = /\((https?:\/\/\S+)\)/g;
+                let match;
+                while ((match = urlPattern.exec(text)) !== null) {
+                  const url = match[1];
+                  if (imageUrls.indexOf(url) == -1) imageUrls.push(url);
+                }
+              }
+            });
+          });
+        }
+      } catch (err) {
+        logger.error(err);
+        reject(err);
+      }
+    });
+    // 将流数据喂给SSE转换器
+    stream.on("data", (buffer) => parser.feed(buffer.toString()));
+    stream.once("error", (err) => reject(err));
+    stream.once("close", () =>
+      resolve({
+        convId,
+        imageUrls,
+      })
+    );
+  });
+}
+
+/**
+ * Token切分
+ *
+ * @param authorization 认证字符串
+ */
+function tokenSplit(authorization: string) {
+  return authorization.replace("Bearer ", "").split(",");
+}
+
+/**
+ * 获取Token存活状态
+ */
+async function getTokenLiveStatus(refreshToken: string) {
+  const sign = await generateSign();
+  const result = await axios.post(
+    "https://chatglm.cn/chatglm/user-api/user/refresh",
+    undefined,
+    {
+      headers: {
+        Authorization: `Bearer ${refreshToken}`,
+        Referer: "https://chatglm.cn/main/alltoolsdetail",
+        "X-Device-Id": util.uuid(false),
+        "X-Request-Id": util.uuid(false),
+        "X-Sign": sign.sign,
+        "X-Timestamp": sign.timestamp,
+        "X-Nonce": sign.nonce,
+        ...getHeaders(),
+      },
+      timeout: 15000,
+      validateStatus: () => true,
+    }
+  );
+  try {
+    const { result: _result } = checkResult(result, refreshToken);
+    const { accessToken } = _result;
+    return !!accessToken;
+  } catch (err) {
+    return false;
+  }
+}
+
+export default {
+  createCompletion,
+  createCompletionStream,
+  generateImages,
+  generateVideos,
+  getTokenLiveStatus,
+  tokenSplit,
+};
