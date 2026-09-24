@@ -1,48 +1,36 @@
 import { PassThrough } from "stream";
-import _ from "lodash";
 import chat from "@/api/controllers/chat.ts";
 import util from "@/lib/util.ts";
 import logger from "@/lib/logger.ts";
 
 const MODEL_NAME = "glm-5.3";
 
-/**
- * ChatGLM's private web endpoint does not expose the Anthropic tool protocol.
- * This adapter therefore implements a compatibility layer for Claude Code:
- *   Claude tools -> explicit prompt protocol -> GLM-5.3 -> tool call parser
- *   -> Anthropic tool_use -> Claude Code executes the tool -> tool_result -> GLM
- *
- * The protocol is intentionally strict and short. Claude Code's real system
- * prompt is also preserved and passed through verbatim before this adapter
- * instruction.
- */
+type ParsedToolCall = { name: string; arguments: Record<string, any> };
+
 const TOOL_PROTOCOL = `
 
-=== AGENT TOOL CALLING PROTOCOL ===
-You are the model inside an agent runtime. Tools listed below are real tools
-provided by the runtime. You MUST use them when the user's task requires them.
-Do not pretend to execute a tool and do not describe a command instead of using
-the tool.
+### CRITICAL AGENT RUNTIME RULES
+You are running INSIDE a coding-agent runtime. The tools below are REAL tools.
+When a task requires reading, creating, editing, deleting, searching, or running files/commands, you MUST invoke the appropriate tool. Do NOT answer with file contents or a command for the user to copy instead.
 
-WHEN A TOOL IS REQUIRED:
-Output a tool call and NOTHING ELSE in that assistant turn, using exactly:
-[tool_call]
+CANONICAL TOOL CALL FORMAT — output ONLY this block when invoking a tool:
+<<<TOOL_CALL>>>
 {"name":"EXACT_TOOL_NAME","arguments":{}}
-[/tool_call]
+<<<END_TOOL_CALL>>>
 
-Rules:
-1. EXACT_TOOL_NAME must exactly match one of the available tool names.
-2. arguments MUST be valid JSON and match the tool input schema.
-3. Do not put the tool call in Markdown fences.
-4. Do not add prose before or after a tool call.
-5. Multiple independent tool calls may be emitted as separate [tool_call] blocks.
-6. Never invent a tool result. Wait for the next user message containing [tool_result].
-7. When tool results are supplied, use them and continue the task normally.
-8. If no tool is required, answer normally.
-9. For file creation/editing, actually call the appropriate tool instead of merely
-   printing the file contents.
+ABSOLUTE RULES:
+- Use an EXACT tool name from AVAILABLE TOOLS.
+- arguments must be valid JSON and match that tool's input schema.
+- Do not use Markdown fences around a tool call.
+- Do not add prose before or after a tool call in the same assistant turn.
+- Multiple independent calls may be emitted as separate blocks.
+- Never fabricate a tool result. Wait for the next tool_result turn.
+- After tool results arrive, continue the task and invoke another tool if needed.
+- If no tool is needed, answer normally.
+- For file creation/editing, ALWAYS invoke Write/Edit (or the matching available tool); never merely print the file.
+- For shell commands, ALWAYS invoke Bash (or the matching available execution tool); never merely print the command.
 
-=== END AGENT TOOL CALLING PROTOCOL ===
+AVAILABLE TOOLS are authoritative. Ignore any tool name that is not listed there.
 `;
 
 function stringifySystem(system?: string | any[]): string {
@@ -56,11 +44,21 @@ function stringifySystem(system?: string | any[]): string {
     return typeof system === "string" ? system : "";
 }
 
-function normalizeTools(tools: any[]): string {
-    if (!Array.isArray(tools) || tools.length === 0) return "";
-    // Keep the exact Claude input_schema. Do not rewrite it into a simplified
-    // shape because Claude Code tools such as Edit/Write have nested schemas.
-    return `\n\n=== AVAILABLE TOOLS (AUTHORITATIVE) ===\n${JSON.stringify(tools, null, 2)}\n=== END AVAILABLE TOOLS ===\n`;
+function compactTools(tools: any[]): string {
+    if (!Array.isArray(tools) || !tools.length) return "";
+
+    const compact = tools.map((tool: any) => {
+        const schema = tool?.input_schema || tool?.function?.parameters || tool?.parameters || {};
+        return {
+            name: tool?.name || tool?.function?.name,
+            description: typeof (tool?.description || tool?.function?.description) === "string"
+                ? String(tool.description || tool.function?.description).slice(0, 700)
+                : "",
+            input_schema: schema,
+        };
+    }).filter((x: any) => typeof x.name === "string" && x.name.length > 0);
+
+    return `\n=== AVAILABLE TOOLS (AUTHORITATIVE) ===\n${JSON.stringify(compact)}\n=== END AVAILABLE TOOLS ===\n`;
 }
 
 function contentToText(content: any): string {
@@ -74,6 +72,7 @@ function contentToText(content: any): string {
 
         if (item.type === "tool_use") {
             return `[assistant_tool_call]\n${JSON.stringify({
+                id: item.id,
                 name: item.name,
                 arguments: item.input || {}
             })}\n[/assistant_tool_call]`;
@@ -81,14 +80,8 @@ function contentToText(content: any): string {
 
         if (item.type === "tool_result") {
             const result = Array.isArray(item.content)
-                ? item.content.map((x: any) => {
-                    if (typeof x === "string") return x;
-                    return x?.text || JSON.stringify(x ?? "");
-                }).join("\n")
-                : (typeof item.content === "string"
-                    ? item.content
-                    : JSON.stringify(item.content ?? ""));
-
+                ? item.content.map((x: any) => typeof x === "string" ? x : (x?.text || JSON.stringify(x ?? ""))).join("\n")
+                : typeof item.content === "string" ? item.content : JSON.stringify(item.content ?? "");
             return `[tool_result]\n${JSON.stringify({
                 tool_use_id: item.tool_use_id,
                 content: result,
@@ -100,28 +93,25 @@ function contentToText(content: any): string {
     }).join("\n");
 }
 
-/** Convert Anthropic/Claude messages to the legacy GLM text conversation. */
-export function convertClaudeToGLM(
-    messages: any[],
-    system?: string | any[],
-    tools?: any[]
-): any[] {
+export function convertClaudeToGLM(messages: any[], system?: string | any[], tools?: any[]): any[] {
     const glmMessages: any[] = [];
     const systemText = stringifySystem(system);
-    const toolText = normalizeTools(tools || []);
+    const toolText = compactTools(tools || []);
     const protocol = tools?.length ? TOOL_PROTOCOL : "";
 
-    const prefix = `${systemText}${toolText}${protocol}${systemText || toolText || protocol ? "\n\n" : ""}`;
-    let firstUser = true;
+    // Put the agent contract before Claude's large system prompt. This is
+    // intentional: ChatGLM's web backend receives a text conversation rather
+    // than a real system role, so the actionable contract must be highly salient.
+    const prefix = `${protocol}${toolText}${systemText ? `\n=== ORIGINAL SYSTEM INSTRUCTIONS ===\n${systemText}\n=== END ORIGINAL SYSTEM INSTRUCTIONS ===\n` : ""}`;
 
+    let firstUser = true;
     for (const msg of messages || []) {
         const role = msg?.role;
         const content = contentToText(msg?.content);
-
         if (role === "user") {
             glmMessages.push({
                 role: "user",
-                content: firstUser && prefix ? prefix + content : content
+                content: firstUser ? `${prefix}\n=== USER REQUEST ===\n${content}` : content
             });
             firstUser = false;
         } else if (role === "assistant") {
@@ -129,24 +119,17 @@ export function convertClaudeToGLM(
         }
     }
 
-    // The upstream accepts a GPT-like role array. Ensure a user turn exists.
-    if (!glmMessages.length) {
-        glmMessages.push({ role: "user", content: prefix || "Hello" });
-    }
-
+    if (!glmMessages.length) glmMessages.push({ role: "user", content: prefix || "Hello" });
     return glmMessages;
 }
 
-type ParsedToolCall = {
-    name: string;
-    arguments: Record<string, any>;
-};
-
-function safeJsonObject(value: any): Record<string, any> | null {
+function safeObject(value: any): Record<string, any> | null {
     if (value && typeof value === "object" && !Array.isArray(value)) return value;
     if (typeof value !== "string") return null;
+    const text = value.trim();
+    if (!text) return {};
     try {
-        const parsed = JSON.parse(value);
+        const parsed = JSON.parse(text);
         return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : null;
     } catch {
         return null;
@@ -155,66 +138,100 @@ function safeJsonObject(value: any): Record<string, any> | null {
 
 function addCall(calls: ParsedToolCall[], name: any, args: any) {
     if (typeof name !== "string" || !name.trim()) return;
-    const parsedArgs = safeJsonObject(args) || {};
-    if (!calls.some(c => c.name === name && JSON.stringify(c.arguments) === JSON.stringify(parsedArgs))) {
-        calls.push({ name: name.trim(), arguments: parsedArgs });
+    let parsed = safeObject(args);
+    if (!parsed && typeof args === "string") {
+        // Some models return a JSON string wrapped one level deeper.
+        try { parsed = safeObject(JSON.parse(args)); } catch { /* ignore */ }
+    }
+    parsed ||= {};
+    const normalized = name.trim();
+    if (!calls.some(c => c.name === normalized && JSON.stringify(c.arguments) === JSON.stringify(parsed))) {
+        calls.push({ name: normalized, arguments: parsed });
     }
 }
 
-/**
- * Accept the strict protocol plus several common variants GLM may emit:
- * - [tool_call] JSON [/tool_call]
- * - <tool_call>JSON</tool_call>
- * - JSON objects containing tool_calls/function calls
- * - fenced JSON containing one of the above
- */
-function parseToolCalls(text: string): ParsedToolCall[] {
+function parseFunctionObject(value: any, calls: ParsedToolCall[]) {
+    const parsed = safeObject(value);
+    if (!parsed) return;
+
+    if (Array.isArray(parsed.tool_calls)) {
+        for (const tc of parsed.tool_calls) {
+            addCall(calls, tc?.function?.name || tc?.name, tc?.function?.arguments ?? tc?.arguments ?? tc?.input ?? {});
+        }
+        return;
+    }
+
+    if (parsed.function?.name) {
+        addCall(calls, parsed.function.name, parsed.function.arguments ?? parsed.function.input ?? {});
+        return;
+    }
+
+    if (parsed.name) addCall(calls, parsed.name, parsed.arguments ?? parsed.input ?? parsed.parameters ?? {});
+}
+
+function parseXmlToolCalls(text: string, calls: ParsedToolCall[]) {
+    // <tool_call><function=Write><parameter=...>...</parameter></function></tool_call>
+    const blocks = text.match(/<tool_call\b[^>]*>[\s\S]*?<\/tool_call>/gi) || [];
+    for (const block of blocks) {
+        const functionMatch = block.match(/<function\s*[=:]\s*["']?([^\s>"']+)["']?\s*>/i) ||
+            block.match(/<function\s+name\s*=\s*["']([^"']+)["'][^>]*>/i);
+        const invokeMatch = block.match(/<invoke\s+name\s*=\s*["']([^"']+)["'][^>]*>/i);
+        const name = functionMatch?.[1] || invokeMatch?.[1];
+        if (!name) {
+            const jsonMatch = block.replace(/^<tool_call[^>]*>|<\/tool_call>$/gi, "").trim();
+            parseFunctionObject(jsonMatch, calls);
+            continue;
+        }
+
+        const args: Record<string, any> = {};
+        const paramRe = /<(?:parameter|param)\s+(?:name|key)\s*=\s*["']([^"']+)["'][^>]*>([\s\S]*?)<\/(?:parameter|param)>/gi;
+        let pm: RegExpExecArray | null;
+        while ((pm = paramRe.exec(block))) {
+            const raw = pm[2].trim();
+            try { args[pm[1]] = JSON.parse(raw); } catch { args[pm[1]] = raw; }
+        }
+        if (!Object.keys(args).length) {
+            const jsonInside = block.match(/<function[^>]*>([\s\S]*?)<\/function>/i)?.[1]?.trim() ||
+                block.match(/<invoke[^>]*>([\s\S]*?)<\/invoke>/i)?.[1]?.trim();
+            if (jsonInside) {
+                const obj = safeObject(jsonInside);
+                if (obj) Object.assign(args, obj);
+            }
+        }
+        addCall(calls, name, args);
+    }
+}
+
+export function parseToolCalls(text: string): ParsedToolCall[] {
     const calls: ParsedToolCall[] = [];
     if (!text) return calls;
 
-    const patterns = [
+    const blockPatterns = [
+        /<<<TOOL_CALL>>>\s*([\s\S]*?)\s*<<<END_TOOL_CALL>>>/gi,
         /\[tool_call\]\s*([\s\S]*?)\s*\[\/tool_call\]/gi,
         /<tool_call>\s*([\s\S]*?)\s*<\/tool_call>/gi,
-        /\[assistant_tool_call\]\s*([\s\S]*?)\s*\[\/assistant_tool_call\]/gi
+        /\[assistant_tool_call\]\s*([\s\S]*?)\s*\[\/assistant_tool_call\]/gi,
+        /<\|tool_call\|>\s*([\s\S]*?)\s*(?:<\|\/tool_call\|>|<\|end\|>)/gi,
     ];
 
-    for (const re of patterns) {
+    for (const re of blockPatterns) {
         let match: RegExpExecArray | null;
-        while ((match = re.exec(text))) {
-            const raw = match[1].trim().replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, "");
-            const parsed = safeJsonObject(raw);
-            if (!parsed) {
-                logger.warn(`Malformed GLM tool call: ${raw.slice(0, 500)}`);
-                continue;
-            }
-
-            if (Array.isArray(parsed.tool_calls)) {
-                for (const tc of parsed.tool_calls) {
-                    addCall(calls, tc?.function?.name || tc?.name, tc?.function?.arguments || tc?.arguments || {});
-                }
-            } else if (parsed.function?.name) {
-                addCall(calls, parsed.function.name, parsed.function.arguments || {});
-            } else {
-                addCall(calls, parsed.name, parsed.arguments || parsed.input || {});
-            }
-        }
+        while ((match = re.exec(text))) parseFunctionObject(match[1].trim(), calls);
     }
 
-    // Some reasoning models emit a raw JSON function-call object without the
-    // marker. Only accept it when it unmistakably looks like a function call.
-    const fenced = /```json\s*([\s\S]*?)```/gi;
+    parseXmlToolCalls(text, calls);
+
+    // Fenced JSON or an entire response containing a function-call object.
+    const fenced = /```(?:json|javascript|js)?\s*([\s\S]*?)```/gi;
     let fm: RegExpExecArray | null;
-    while ((fm = fenced.exec(text))) {
-        const parsed = safeJsonObject(fm[1].trim());
-        if (!parsed) continue;
-        if (parsed.tool_calls || parsed.function || parsed.name) {
-            if (Array.isArray(parsed.tool_calls)) {
-                for (const tc of parsed.tool_calls) addCall(calls, tc?.function?.name || tc?.name, tc?.function?.arguments || tc?.arguments || {});
-            } else if (parsed.function?.name) {
-                addCall(calls, parsed.function.name, parsed.function.arguments || {});
-            } else {
-                addCall(calls, parsed.name, parsed.arguments || parsed.input || {});
-            }
+    while ((fm = fenced.exec(text))) parseFunctionObject(fm[1].trim(), calls);
+
+    // Only inspect standalone JSON-ish lines. This avoids interpreting normal
+    // prose that happens to contain a {name: ...} fragment as a tool call.
+    for (const line of text.split(/\r?\n/)) {
+        const s = line.trim();
+        if ((s.startsWith("{") && s.endsWith("}")) || s.startsWith("{\"tool_calls\"")) {
+            parseFunctionObject(s, calls);
         }
     }
 
@@ -223,30 +240,24 @@ function parseToolCalls(text: string): ParsedToolCall[] {
 
 function removeToolCallBlocks(text: string): string {
     return text
+        .replace(/<<<TOOL_CALL>>>[\s\S]*?<<<END_TOOL_CALL>>>/gi, "")
         .replace(/\[tool_call\][\s\S]*?\[\/tool_call\]/gi, "")
         .replace(/<tool_call>[\s\S]*?<\/tool_call>/gi, "")
         .replace(/\[assistant_tool_call\][\s\S]*?\[\/assistant_tool_call\]/gi, "")
-        .replace(/\[CLAUDE_CODE_TOOL_PROTOCOL\][\s\S]*?\[END_CLAUDE_CODE_TOOL_PROTOCOL\]/gi, "")
+        .replace(/<\|tool_call\|>[\s\S]*?(?:<\|\/tool_call\|>|<\|end\|>)/gi, "")
         .trim();
 }
 
 function buildClaudeResponse(glmResponse: any): any {
     const choice = glmResponse?.choices?.[0] || {};
-    const rawText = typeof choice?.message?.content === "string"
-        ? choice.message.content
-        : contentToText(choice?.message?.content);
+    const rawText = typeof choice?.message?.content === "string" ? choice.message.content : contentToText(choice?.message?.content);
     const toolCalls = parseToolCalls(rawText);
     const content: any[] = [];
     const text = removeToolCallBlocks(rawText);
-
     if (text) content.push({ type: "text", text });
+
     for (const call of toolCalls) {
-        content.push({
-            type: "tool_use",
-            id: `toolu_${util.uuid().replace(/-/g, "")}`,
-            name: call.name,
-            input: call.arguments
-        });
+        content.push({ type: "tool_use", id: `toolu_${util.uuid().replace(/-/g, "")}`, name: call.name, input: call.arguments });
     }
 
     return {
@@ -264,15 +275,12 @@ function buildClaudeResponse(glmResponse: any): any {
     };
 }
 
-export function convertGLMToClaude(glmResponse: any): any {
-    return buildClaudeResponse(glmResponse);
-}
+export function convertGLMToClaude(glmResponse: any): any { return buildClaudeResponse(glmResponse); }
 
 function writeSse(stream: PassThrough, event: string, data: any) {
     stream.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
 }
 
-/** Buffer upstream GLM SSE so tool calls are emitted as atomic Anthropic blocks. */
 export function convertGLMStreamToClaude(glmStream: any): PassThrough {
     const out = new PassThrough();
     const messageId = `msg_${util.uuid().replace(/-/g, "")}`;
@@ -291,12 +299,7 @@ export function convertGLMStreamToClaude(glmStream: any): PassThrough {
         const blocks: any[] = [];
         if (cleanText) blocks.push({ type: "text", text: cleanText });
         for (const call of toolCalls) {
-            blocks.push({
-                type: "tool_use",
-                id: `toolu_${util.uuid().replace(/-/g, "")}`,
-                name: call.name,
-                input: call.arguments
-            });
+            blocks.push({ type: "tool_use", id: `toolu_${util.uuid().replace(/-/g, "")}`, name: call.name, input: call.arguments });
         }
 
         writeSse(out, "message_start", {
@@ -323,28 +326,16 @@ export function convertGLMStreamToClaude(glmStream: any): PassThrough {
             });
 
             if (block.type === "text") {
-                writeSse(out, "content_block_delta", {
-                    type: "content_block_delta",
-                    index,
-                    delta: { type: "text_delta", text: block.text }
-                });
+                writeSse(out, "content_block_delta", { type: "content_block_delta", index, delta: { type: "text_delta", text: block.text } });
             } else {
-                writeSse(out, "content_block_delta", {
-                    type: "content_block_delta",
-                    index,
-                    delta: { type: "input_json_delta", partial_json: JSON.stringify(block.input) }
-                });
+                writeSse(out, "content_block_delta", { type: "content_block_delta", index, delta: { type: "input_json_delta", partial_json: JSON.stringify(block.input) } });
             }
-
             writeSse(out, "content_block_stop", { type: "content_block_stop", index });
         });
 
         writeSse(out, "message_delta", {
             type: "message_delta",
-            delta: {
-                stop_reason: toolCalls.length ? "tool_use" : "end_turn",
-                stop_sequence: null
-            },
+            delta: { stop_reason: toolCalls.length ? "tool_use" : "end_turn", stop_sequence: null },
             usage: { output_tokens: outputTokens || 1 }
         });
         writeSse(out, "message_stop", { type: "message_stop" });
@@ -361,7 +352,6 @@ export function convertGLMStreamToClaude(glmStream: any): PassThrough {
             if (!trimmed.startsWith("data:")) continue;
             const raw = trimmed.slice(5).trim();
             if (!raw || raw === "[DONE]") continue;
-
             try {
                 const data = JSON.parse(raw);
                 const choice = data?.choices?.[0];
@@ -380,12 +370,8 @@ export function convertGLMStreamToClaude(glmStream: any): PassThrough {
 
     glmStream.on("error", (err: any) => {
         logger.error(`GLM stream error: ${err}`);
-        if (!finished) {
-            finished = true;
-            out.destroy(err);
-        }
+        if (!finished) { finished = true; out.destroy(err); }
     });
-
     glmStream.on("end", finish);
     glmStream.on("close", finish);
     return out;
@@ -396,32 +382,20 @@ export async function createClaudeCompletion(
     messages: any[],
     system: string | any[] | undefined,
     refreshToken: string,
-    stream: boolean = false,
+    stream = false,
     conversationId?: string,
     tools?: any[]
 ): Promise<any | PassThrough> {
     try {
         const glmMessages = convertClaudeToGLM(messages, system, tools);
-        const glmModel = "glm-5.3";
-
-        logger.info(`Claude Code request -> ${glmModel}; tools=${tools?.length || 0}; stream=${stream}`);
+        logger.info(`Claude Code -> ${MODEL_NAME}; tools=${tools?.length || 0}; stream=${stream}`);
 
         if (stream) {
-            const glmStream = await chat.createCompletionStream(
-                glmMessages,
-                refreshToken,
-                glmModel,
-                conversationId
-            );
+            const glmStream = await chat.createCompletionStream(glmMessages, refreshToken, MODEL_NAME, conversationId);
             return convertGLMStreamToClaude(glmStream);
         }
 
-        const glmResponse = await chat.createCompletion(
-            glmMessages,
-            refreshToken,
-            glmModel,
-            conversationId
-        );
+        const glmResponse = await chat.createCompletion(glmMessages, refreshToken, MODEL_NAME, conversationId);
         return convertGLMToClaude(glmResponse);
     } catch (error) {
         logger.error(`Error creating Claude completion: ${error}`);

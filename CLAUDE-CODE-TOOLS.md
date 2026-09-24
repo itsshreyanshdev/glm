@@ -1,29 +1,31 @@
 # Claude Code + GLM-5.3 tool calling
 
-This build exposes an Anthropic-compatible `/v1/messages` endpoint for Claude Code while keeping the reverse-engineered ChatGLM web backend.
+This build exposes an Anthropic-compatible `/v1/messages` adapter while retaining the existing reverse-engineered ChatGLM web backend and GLM-5.3 request metadata.
 
-## What it does
+## Tool-calling adapter
 
-- Routes Claude Code model aliases to `glm-5.3`.
-- Preserves the Claude system prompt and full tool schemas.
-- Converts Claude `tool_use` history and `tool_result` history into the upstream text conversation.
-- Injects a strict tool protocol asking GLM-5.3 to emit machine-readable tool calls.
-- Parses `[tool_call]`, XML `<tool_call>`, and common JSON/function-call variants.
-- Converts parsed calls back to Anthropic `tool_use` blocks.
-- Supports streaming `/v1/messages` with Anthropic SSE events.
-- `/v1/messages/count_tokens` is supported for Claude Code.
+The adapter:
 
-## Claude Code
+- Preserves the incoming Claude system instructions.
+- Converts Anthropic `tools` into a compact authoritative tool manifest.
+- Places the tool contract before the large Claude system prompt because the ChatGLM backend receives a text conversation rather than a native system role.
+- Uses a canonical `<<<TOOL_CALL>>>...<<<END_TOOL_CALL>>>` format.
+- Parses several fallback formats: canonical blocks, `[tool_call]`, XML `<tool_call>`, `<invoke>`, `<function>`, fenced JSON, and common function/tool-call JSON.
+- Converts parsed calls to Anthropic `tool_use` blocks.
+- Converts Claude `tool_result` blocks back into the GLM conversation.
+- Supports multiple tool calls in one response.
+- Buffers GLM streaming output so a tool call is emitted atomically as an Anthropic `tool_use` block.
+- Keeps `/v1/messages/count_tokens` available for Claude Code.
 
-Set:
+This remains a compatibility layer: the private ChatGLM web endpoint is not being given a native Anthropic `tools` field. Tool execution itself remains on the Claude Code side; the adapter only translates the model's textual tool-call representation into Anthropic `tool_use`.
+
+## Deploy
 
 ```bash
-export ANTHROPIC_BASE_URL="https://YOUR_DOMAIN"
-export ANTHROPIC_API_KEY="YOUR_API_KEY"
+npm install
+npm run build
 ```
 
-Then run Claude Code normally.
+Then restart the existing container/service. Caddy does not need to be changed.
 
-## Important
-
-This is a protocol compatibility layer. The upstream private ChatGLM endpoint does not expose Anthropic-native tool calls, so GLM-5.3 is instructed to emit a strict textual tool-call format and the adapter translates it to Anthropic `tool_use`. Tool reliability therefore depends on GLM-5.3 following the protocol.
+If Caddy and the API are separate Docker networks, make sure the API container is attached to the same network as Caddy (for the setup described in the deployment notes, `newapi_default`).
